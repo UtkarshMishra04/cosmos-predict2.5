@@ -87,7 +87,7 @@ class VideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.video_paths)
 
-    def _load_video(self, video_path: str) -> tuple[np.ndarray, float]:
+    def _load_video(self, video_path: str) -> tuple[np.ndarray, float, list[float]]:
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
         total_frames = len(vr)
         if total_frames < self.sequence_length:
@@ -110,7 +110,7 @@ class VideoDataset(Dataset):
         except Exception:  # failed to read FPS, assume it is 16
             fps = 16
         del vr  # delete the reader to avoid memory leak
-        return frame_data, fps
+        return frame_data, fps, [start_frame, end_frame, total_frames]
 
     def _setup_caption_format(self) -> None:
         """Determine the caption format and set up the caption directory."""
@@ -181,19 +181,43 @@ class VideoDataset(Dataset):
         except Exception as e:
             log.warning(f"Failed to read JSON caption file {json_path}: {e}")
             return ""
+        
+    def _add_progress_bar(self, frames: torch.Tensor, frame_ids: list[float]) -> torch.Tensor:
+        T, C, H, W = frames.shape
+        bar_width = W // 2
+        
+        # Create a white background for the progress bar
+        progress_bar = torch.full((T, C, H, bar_width), 255, dtype=frames.dtype, device=frames.device)
+        
+        start_frame, end_frame, total_frames = frame_ids
+        start_h = int(float(start_frame / total_frames) * H)
+        end_h = int(float(end_frame / total_frames) * H)
+        
+        # Ensure indices are within bounds
+        start_h = max(0, min(H, start_h))
+        end_h = max(0, min(H, end_h))
+        
+        # Set the corresponding rows to black
+        if end_h > start_h:
+            progress_bar[:, :, start_h:end_h, :] = 0
+            
+        frames = torch.cat([frames, progress_bar], dim=3)
+        return frames
 
-    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
-        frames, fps = self._load_video(video_path)
+    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float, list[int]]:
+        frames, fps, frame_ids = self._load_video(video_path)
         frames = frames.astype(np.uint8)
         frames = torch.from_numpy(frames).permute(0, 3, 1, 2)  # [T, C, H, W]
         frames = self.preprocess(frames)
         frames = torch.clamp(frames * 255.0, 0, 255).to(torch.uint8)
-        return frames, fps
+        # Add a progress bar image of same height and width/2, make all horizontal rows black between the frame ids corresponding
+        frames = self._add_progress_bar(frames, frame_ids)
+        return frames, fps, frame_ids
 
     def __getitem__(self, index: int) -> dict | Any:
         try:
             data = dict()
-            video, fps = self._get_frames(self.video_paths[index])
+            video, fps, frame_ids = self._get_frames(self.video_paths[index])
             video = video.permute(1, 0, 2, 3)  # Rearrange from [T, C, H, W] to [C, T, H, W]
 
             # Load caption based on format
@@ -208,7 +232,7 @@ class VideoDataset(Dataset):
                 caption = self._load_text(Path(caption_path))
 
             data["video"] = video
-            data["ai_caption"] = caption
+            data["ai_caption"] = caption + f" Current progress is from {frame_ids[0]} to {frame_ids[1]} out of {frame_ids[2]} frames."
 
             _, _, h, w = video.shape
 

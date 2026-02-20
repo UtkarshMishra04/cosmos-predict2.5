@@ -15,7 +15,7 @@
 
 import torch
 import transformer_engine as te
-import transformer_engine_torch as tex
+import transformer_engine.pytorch as tex
 
 from cosmos_predict2._src.imaginaire.utils import distributed, log
 
