@@ -170,7 +170,7 @@ predict2_video2world_training_2b_cosmos_robocasa_assets_flat_short = dict(
     ),
     trainer=dict(
         logging_iter=100,
-        max_iter=40000,
+        max_iter=60000,
         callbacks=dict(
             heart_beat=dict(
                 save_s3=False,

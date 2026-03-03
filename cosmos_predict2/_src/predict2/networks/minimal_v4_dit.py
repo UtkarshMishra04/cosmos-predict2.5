@@ -55,6 +55,8 @@ else:
     from transformer_engine.pytorch.attention import apply_rotary_pos_emb
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
+import torch.nn.functional as F
+
 from cosmos_predict2._src.imaginaire.attention import attention
 from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.imaginaire.utils.context_parallel import split_inputs_cp
@@ -428,6 +430,7 @@ class Attention(nn.Module):
         qkv_format: str = "bshd",
         backend: str = "transformer_engine",
         use_wan_fp32_strategy: bool = False,
+        temporal_causal: bool = False,
     ) -> None:
         super().__init__()
         log.debug(
@@ -435,6 +438,7 @@ class Attention(nn.Module):
             f"{n_heads} heads with a dimension of {head_dim}."
         )
         self.is_selfattn = context_dim is None  # self attention
+        self.temporal_causal = temporal_causal
 
         assert backend in ["transformer_engine", "torch", "torch-flex", "minimal_a2a", "i4"], (
             f"Invalid backend: {backend}"
@@ -540,6 +544,30 @@ class Attention(nn.Module):
 
         return q, k, v
 
+    # Cache for temporal-causal masks keyed by (T, H, W, device_str)
+    _temporal_causal_mask_cache: dict = {}
+
+    @staticmethod
+    def _get_temporal_causal_mask(T: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Build a block-lower-triangular boolean attention mask.
+
+        For a flattened sequence of length S = T*H*W, position i attends to
+        position j iff time(j) <= time(i), where time(i) = i // (H*W).
+        This gives full bidirectional attention within each frame and causal
+        attention across frames.
+        """
+        key = (T, H, W, str(device))
+        if key not in Attention._temporal_causal_mask_cache:
+            S = T * H * W
+            hw = H * W
+            # time index for each position in the flattened sequence
+            time_idx = torch.arange(S, device=device) // hw  # (S,)
+            # mask[i, j] = True means position i can attend to position j
+            # i.e. time(i) >= time(j): position i attends to past and present
+            mask = time_idx.unsqueeze(1) >= time_idx.unsqueeze(0)  # (S, S)
+            Attention._temporal_causal_mask_cache[key] = mask
+        return Attention._temporal_causal_mask_cache[key]
+
     def compute_attention(
         self,
         q,
@@ -548,6 +576,24 @@ class Attention(nn.Module):
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
     ):
+        # ── Temporal-causal path (self-attention only) ──
+        # Uses explicit boolean mask with F.scaled_dot_product_attention:
+        # within each frame: full bidirectional; across frames: strictly causal.
+        if self.temporal_causal and self.is_selfattn and video_size is not None:
+            B, S, n_heads, head_dim = q.shape
+            T, H, W = video_size.T, video_size.H, video_size.W
+            dtype = torch.bfloat16
+            # SDPA expects (B, n_heads, S, head_dim)
+            q_sdpa = q.to(dtype).transpose(1, 2)
+            k_sdpa = k.to(dtype).transpose(1, 2)
+            v_sdpa = v.to(dtype).transpose(1, 2)
+            attn_mask = self._get_temporal_causal_mask(T, H, W, q.device)
+            out = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, attn_mask=attn_mask)
+            out = out.transpose(1, 2).contiguous()  # (B, S, n_heads, head_dim)
+            result = out.reshape(B, S, n_heads * head_dim)
+            return self.output_dropout(self.output_proj(result))
+
+        # ── Original bidirectional path ──
         additional_args = {}
         if isinstance(self.attn_op, (NattenA2AAttnOp, NeighborhoodAttention)) or self.backend == "i4":
             additional_args["video_size"] = video_size
@@ -1163,6 +1209,7 @@ class Block(nn.Module):
         backend: str = "transformer_engine",
         image_context_dim: Optional[int] = None,
         use_wan_fp32_strategy: bool = False,
+        temporal_causal: bool = False,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -1175,6 +1222,7 @@ class Block(nn.Module):
             qkv_format="bshd",
             backend=backend,
             use_wan_fp32_strategy=use_wan_fp32_strategy,
+            temporal_causal=temporal_causal,
         )
 
         self.layer_norm_cross_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
@@ -1486,6 +1534,8 @@ class MiniTrainDIT(WeightTrainingStat):
         natten_parameters: Union[dict, list] = None,
         # if True, will closely match wan's strategy to use fp32 in certain layers/operations
         use_wan_fp32_strategy: bool = False,
+        # if True, self-attention is causal across time but bidirectional within each frame
+        atten_temporal_causal: bool = False,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1539,6 +1589,7 @@ class MiniTrainDIT(WeightTrainingStat):
                     backend=atten_backend,
                     image_context_dim=None if extra_image_context_dim is None else model_channels,
                     use_wan_fp32_strategy=use_wan_fp32_strategy,
+                    temporal_causal=atten_temporal_causal,
                 )
                 for _ in range(num_blocks)
             ]

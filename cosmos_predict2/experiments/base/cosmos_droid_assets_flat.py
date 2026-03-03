@@ -103,7 +103,7 @@ predict2_video2world_training_2b_cosmos_droid_assets_flat = dict(
     ),
     dataloader_train=dataloader_train_cosmos_droid_assets,
     checkpoint=dict(
-        save_iter=5000,
+        save_iter=2000,
         # pyrefly: ignore  # missing-attribute
         load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
         load_from_object_store=dict(
@@ -175,7 +175,7 @@ predict2_video2world_training_2b_cosmos_droid_assets_flat_short = dict(
     ),
     dataloader_train=dataloader_train_cosmos_droid_assets_short,
     checkpoint=dict(
-        save_iter=10000,
+        save_iter=5000,
         # pyrefly: ignore  # missing-attribute
         load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
         load_from_object_store=dict(
