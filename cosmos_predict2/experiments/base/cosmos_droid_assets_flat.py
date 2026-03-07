@@ -49,14 +49,16 @@ dataloader_train_cosmos_droid_assets = L(get_generic_dataloader)(
 # Shorter version for quick testing
 example_video_dataset_cosmos_droid_assets_short = L(VideoDatasetFlat)(
     dataset_dir="/k8s-nfs/personal/mishutk/droid_video",
-    num_frames=25,
+    num_frames=17,
     video_size=(224, 224*3),
+    frame_skip=2
 )
 
 example_video_dataset_cosmos_droid_polaris_assets_short = L(VideoDatasetFlat)(
     dataset_dir="/k8s-nfs/personal/mishutk/polaris_droid_video",
-    num_frames=25,
+    num_frames=17,
     video_size=(224, 224*3),
+    frame_skip=2
 )
 
 # dataloader_train_cosmos_droid_assets_short = L(get_generic_dataloader)(
@@ -73,15 +75,15 @@ dataloader_train_cosmos_droid_assets_short = L(get_generic_weighted_dataloader)(
         example_video_dataset_cosmos_droid_assets_short,
         example_video_dataset_cosmos_droid_polaris_assets_short,
     ],
-    weights=[0.9, 0.1],
+    weights=[0.95, 0.05],
     sampler=L(get_weighted_sampler)(
         datasets=[
             example_video_dataset_cosmos_droid_assets_short,
             example_video_dataset_cosmos_droid_polaris_assets_short,
         ],
-        weights=[0.9, 0.1],
+        weights=[0.95, 0.05],
     ),
-    batch_size=16,
+    batch_size=8,
     drop_last=True,
     num_workers=4,
     pin_memory=True,

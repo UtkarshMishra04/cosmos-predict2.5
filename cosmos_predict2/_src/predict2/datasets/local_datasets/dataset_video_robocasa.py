@@ -237,6 +237,7 @@ class VideoDatasetFlat(Dataset):
         prompt_type: str | None = None,  # "long", "short", "medium", or None for auto
         caption_format: str = "auto",  # "text", "json", or "auto"
         video_paths: Optional[list[str]] = None,
+        frame_skip: int = 1,  # Sample every Nth frame (1 = consecutive, 2 = every other, etc.)
     ) -> None:
         """Dataset class for loading image-text-to-video generation data.
 
@@ -248,6 +249,8 @@ class VideoDatasetFlat(Dataset):
                                      If None, uses the first available prompt type.
                                      Only applicable when using JSON format.
             caption_format (str): Caption format - "text", "json", or "auto" to detect automatically
+            frame_skip (int): Sample every Nth frame. 1 = consecutive (no skip),
+                             2 = every other frame, etc. Covers a wider temporal window.
 
         Returns dict with:
             - video: RGB frames tensor [T,C,H,W]
@@ -257,6 +260,7 @@ class VideoDatasetFlat(Dataset):
         super().__init__()
         self.dataset_dir = dataset_dir
         self.sequence_length = num_frames
+        self.frame_skip = frame_skip
         self.prompt_type = prompt_type
         self.caption_format = caption_format
 
@@ -284,17 +288,21 @@ class VideoDatasetFlat(Dataset):
     def _load_video(self, video_path: str) -> tuple[np.ndarray, float, list[float]]:
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
         total_frames = len(vr)
-        if total_frames < self.sequence_length:
+
+        # With frame_skip, we need (sequence_length - 1) * frame_skip + 1 raw frames
+        span = (self.sequence_length - 1) * self.frame_skip + 1
+        if total_frames < span:
             raise ValueError(
                 f"Video {video_path} has only {total_frames} frames, "
-                f"at least {self.sequence_length} frames are required."
+                f"at least {span} frames are required "
+                f"(sequence_length={self.sequence_length}, frame_skip={self.frame_skip})."
             )
 
-        # randomly sample a sequence of frames
-        max_start_idx = total_frames - self.sequence_length
-        start_frame = np.random.randint(0, max_start_idx)
-        end_frame = start_frame + self.sequence_length
-        frame_ids = np.arange(start_frame, end_frame).tolist()
+        # Randomly sample a start position, then take every frame_skip-th frame
+        max_start_idx = total_frames - span
+        start_frame = np.random.randint(0, max_start_idx + 1)
+        frame_ids = np.arange(start_frame, start_frame + span, self.frame_skip).tolist()
+        end_frame = frame_ids[-1] + 1
 
         frame_data = vr.get_batch(frame_ids).asnumpy()
         vr.seek(0)  # set video reader point back to 0 to clean up cache

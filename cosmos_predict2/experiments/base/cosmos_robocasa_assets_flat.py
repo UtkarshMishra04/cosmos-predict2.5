@@ -49,6 +49,7 @@ example_video_dataset_cosmos_robocasa_assets_short = L(VideoDatasetFlat)(
     dataset_dir="/k8s-nfs/dev_mishutk/openpi-video/checkpoints/extra_ft_check/datasets/robocasa",
     num_frames=17,
     video_size=(224, 224*3),
+    frame_skip=2
 )
 
 dataloader_train_cosmos_robocasa_assets_short = L(get_generic_dataloader)(
@@ -144,7 +145,7 @@ predict2_video2world_training_2b_cosmos_robocasa_assets_flat_short = dict(
     job=dict(
         project="cosmos_predict_v2p5",
         group="video2world",
-        name="2b_cosmos_robocasa_assets_flat_short",
+        name="2b_cosmos_robocasa_assets_flat_short_frameskip_2",
     ),
     dataloader_train=dataloader_train_cosmos_robocasa_assets_short,
     checkpoint=dict(
