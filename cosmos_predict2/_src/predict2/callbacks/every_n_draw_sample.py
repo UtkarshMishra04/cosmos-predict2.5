@@ -328,6 +328,15 @@ class EveryNDrawSample(EveryN):
         return None
 
     def run_save(self, to_show, batch_size, base_fp_wo_ext) -> Optional[str]:
+        # Resize all tensors to match the first tensor's spatial dims (VAE decode may change resolution)
+        target_h, target_w = to_show[0].shape[-2], to_show[0].shape[-1]
+        for i in range(1, len(to_show)):
+            if to_show[i].shape[-2] != target_h or to_show[i].shape[-1] != target_w:
+                b, c, t, h, w = to_show[i].shape
+                # Reshape to (b*t, c, h, w) for interpolation, then back
+                frames = to_show[i].permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+                frames = torch.nn.functional.interpolate(frames, size=(target_h, target_w), mode="bilinear", align_corners=False)
+                to_show[i] = frames.reshape(b, t, c, target_h, target_w).permute(0, 2, 1, 3, 4)
         to_show = (1.0 + torch.stack(to_show, dim=0).clamp(-1, 1)) / 2.0  # [n, b, c, t, h, w]
         is_single_frame = to_show.shape[3] == 1
         n_viz_sample = min(self.n_viz_sample, batch_size)
