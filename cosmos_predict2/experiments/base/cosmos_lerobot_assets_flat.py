@@ -21,8 +21,6 @@ Usage:
     -- experiment=predict2_video2world_training_2b_cosmos_lerobot_libero_flat_short
 """
 
-import math
-
 from hydra.core.config_store import ConfigStore
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
@@ -50,40 +48,60 @@ DEFAULT_CHECKPOINT_14B = MODEL_CHECKPOINTS[ModelKey(post_trained=False, size=Mod
 # ---------------------------------------------------------------------------
 # Dataset metadata: {name: (num_episodes, avg_episode_length, frame_skip)}
 DATASET_INFO = {
-    "libero":  (1693,  162, 1),
+    "libero":  (5614,  162, 1),  # libero_10 (1693) + libero_90 (3921)
     "droid":   (57774, 255, 2),
     "robocasa": (1199, 264, 2),
     "yam":     (92,    448, 4),
 }
 NUM_FRAMES_PER_SAMPLE = 17
-REFERENCE_EFFECTIVE_BATCH = 8  # LR was tuned for this effective batch size
+
+
+def _detect_num_gpus() -> int:
+    """Auto-detect number of GPUs from environment (set by torchrun/slurm)."""
+    import os
+    # torchrun sets WORLD_SIZE; slurm sets SLURM_NTASKS or SLURM_GPUS_ON_NODE * SLURM_NNODES
+    for var in ("WORLD_SIZE", "SLURM_NTASKS"):
+        val = os.environ.get(var)
+        if val is not None:
+            return int(val)
+    # Fallback: count visible CUDA devices
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if cuda_visible:
+        return len(cuda_visible.split(","))
+    return 8  # safe default
 
 
 def compute_training_params(
     dataset_name: str,
     batch_size_per_gpu: int,
-    num_gpus: int = 8,
+    num_gpus: int | None = None,
     base_lr: float = 2 ** (-14.5),
     target_full_passes: int = 15,
     min_iter: int = 5000,
     max_iter_cap: int = 80000,
 ) -> dict:
-    """Compute LR (linear scaling) and max_iter (target full-coverage passes).
+    """Compute LR and max_iter (target full-coverage passes).
 
     A "full-coverage pass" = enough samples to statistically cover every frame
     in every episode once (accounting for frame_skip and num_frames_per_sample).
 
     Args:
-        base_lr: Reference LR tuned for REFERENCE_EFFECTIVE_BATCH (8).
+        num_gpus: Number of GPUs. None = auto-detect from WORLD_SIZE / CUDA_VISIBLE_DEVICES.
+        base_lr: Reference LR (used directly, no batch scaling — matches MP4 pipeline).
         target_full_passes: How many times to cover every frame in every episode.
         min_iter: Floor on max_iter (diffusion models need enough steps to converge).
         max_iter_cap: Ceiling on max_iter to keep training time bounded.
     """
+    if num_gpus is None:
+        num_gpus = _detect_num_gpus()
     num_episodes, avg_ep_len, frame_skip = DATASET_INFO[dataset_name]
     effective_batch = batch_size_per_gpu * num_gpus
 
-    # Linear LR scaling
-    lr = base_lr * (effective_batch / REFERENCE_EFFECTIVE_BATCH)
+    # Use base_lr directly — no batch scaling.
+    # The MP4 pipeline (cosmos_libero_both_assets_flat) uses lr=2**(-14.5) without
+    # scaling, and that setup does not overfit. The previous 16x linear scaling
+    # (effective_batch=128 / ref=8) was causing rapid memorisation.
+    lr = base_lr
 
     # Samples needed per episode to cover all its (subsampled) frames
     effective_ep_len = avg_ep_len / frame_skip
@@ -105,14 +123,30 @@ def compute_training_params(
 
 
 # ---------------------------------------------------------------------------
-# LIBERO dataset (2 cameras: image + wrist_image)
+# LIBERO dataset (libero_10 + libero_90, 2 cameras: image + wrist_image)
 # ---------------------------------------------------------------------------
-example_lerobot_libero_short = L(LeRobotVideoDatasetFlat)(
+from torch.utils.data import ConcatDataset
+
+example_lerobot_libero_10_short = L(LeRobotVideoDatasetFlat)(
     repo_id="physical-intelligence/libero",
     num_frames=17,
     video_size=(224, 224 * 2),
     camera_keys=None,  # Auto-detect from dataset
     layout="horizontal",  # 2 cameras → horizontal concat
+    augment=True,
+)
+
+example_lerobot_libero_90_short = L(LeRobotVideoDatasetFlat)(
+    repo_id="IPEC-COMMUNITY/libero_90_no_noops_lerobot",
+    num_frames=17,
+    video_size=(224, 224 * 2),
+    camera_keys=None,
+    layout="horizontal",
+    augment=True,
+)
+
+example_lerobot_libero_short = L(ConcatDataset)(
+    datasets=[example_lerobot_libero_10_short, example_lerobot_libero_90_short],
 )
 
 dataloader_train_lerobot_libero_short = L(get_generic_dataloader)(
@@ -120,7 +154,7 @@ dataloader_train_lerobot_libero_short = L(get_generic_dataloader)(
     sampler=L(get_sampler)(dataset=example_lerobot_libero_short),
     batch_size=16,
     drop_last=True,
-    num_workers=4,
+    num_workers=8,
     pin_memory=True,
 )
 
@@ -211,7 +245,7 @@ dataloader_train_lerobot_yam_short = L(get_generic_dataloader)(
 # ---------------------------------------------------------------------------
 # Experiment: LIBERO
 # ---------------------------------------------------------------------------
-_libero_2b = compute_training_params("libero", batch_size_per_gpu=16, base_lr=2 ** (-14.5), target_full_passes=100)
+_libero_2b = compute_training_params("libero", batch_size_per_gpu=16, base_lr=2 ** (-15), target_full_passes=50)
 predict2_video2world_training_2b_cosmos_lerobot_libero_flat_short = dict(
     defaults=[
         f"/experiment/{DEFAULT_CHECKPOINT.experiment}",
@@ -312,7 +346,7 @@ predict2_video2world_training_2b_cosmos_lerobot_droid_flat_short = dict(
 # ---------------------------------------------------------------------------
 # Experiment: ROBOCASA
 # ---------------------------------------------------------------------------
-_robocasa_2b = compute_training_params("robocasa", batch_size_per_gpu=8, base_lr=2 ** (-14.5), target_full_passes=100)
+_robocasa_2b = compute_training_params("robocasa", batch_size_per_gpu=8, base_lr=2 ** (-15), target_full_passes=50)
 predict2_video2world_training_2b_cosmos_lerobot_robocasa_flat_short = dict(
     defaults=[
         f"/experiment/{DEFAULT_CHECKPOINT.experiment}",
@@ -496,7 +530,7 @@ _BASE_LR_14B = 2 ** (-15.5)  # Lower base LR for 14B (larger model → more sens
 # ---------------------------------------------------------------------------
 # Experiment: LIBERO 14B
 # ---------------------------------------------------------------------------
-_libero_14b = compute_training_params("libero", batch_size_per_gpu=16, base_lr=_BASE_LR_14B, target_full_passes=100)
+_libero_14b = compute_training_params("libero", batch_size_per_gpu=16, base_lr=_BASE_LR_14B, target_full_passes=50)
 predict2_video2world_training_14b_cosmos_lerobot_libero_flat_short = dict(
     defaults=[
         f"/experiment/{DEFAULT_CHECKPOINT_14B.experiment}",
@@ -704,7 +738,7 @@ predict2_video2world_training_14b_cosmos_lerobot_droid_flat_short = dict(
 # ---------------------------------------------------------------------------
 # Experiment: ROBOCASA 14B
 # ---------------------------------------------------------------------------
-_robocasa_14b = compute_training_params("robocasa", batch_size_per_gpu=8, base_lr=_BASE_LR_14B, target_full_passes=100)
+_robocasa_14b = compute_training_params("robocasa", batch_size_per_gpu=8, base_lr=_BASE_LR_14B, target_full_passes=50)
 predict2_video2world_training_14b_cosmos_lerobot_robocasa_flat_short = dict(
     defaults=[
         f"/experiment/{DEFAULT_CHECKPOINT_14B.experiment}",

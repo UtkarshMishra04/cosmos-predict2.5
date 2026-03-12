@@ -77,6 +77,7 @@ class LeRobotVideoDatasetFlat(Dataset):
         layout: str = "quad",  # "horizontal" or "quad"
         frame_skip: int = 1,
         video_backend: Optional[str] = None,
+        augment: bool = False,
     ) -> None:
         """
         Args:
@@ -88,6 +89,7 @@ class LeRobotVideoDatasetFlat(Dataset):
             frame_skip: Sample every Nth frame (1 = consecutive).
             video_backend: Video decoder backend ("torchcodec" or "pyav").
                 None = auto-detect. Use "pyav" for av1-encoded videos.
+            augment: If True, apply color jitter and Gaussian blur augmentation.
         """
         super().__init__()
 
@@ -156,6 +158,16 @@ class LeRobotVideoDatasetFlat(Dataset):
             ToTensorVideo(),
             ResizePreprocess((video_size[0], video_size[1])),
         ])
+
+        # Optional data augmentation to reduce overfitting
+        # Matches cosmos-policy apply_image_aug() stronger=True:
+        #   - Fixed 90% area crop (same region for all frames)
+        #   - ColorJitter: brightness ±0.3, contrast ±0.4, saturation ±0.5, hue ±0.05
+        self.augment_transform = None
+        self.augment_crop_scale = (0.9, 0.9) if augment else None
+        self.video_size = video_size
+        if augment:
+            self.augment_transform = T.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5, hue=0.05)
 
     def __str__(self) -> str:
         return f"LeRobotVideoDatasetFlat({self.repo_id}, {len(self.valid_episodes)} episodes)"
@@ -262,6 +274,21 @@ class LeRobotVideoDatasetFlat(Dataset):
 
         # preprocess: ToTensorVideo (uint8 → float/255) + ResizePreprocess
         frames = self.preprocess(frames)
+        # Random crop (same region for all frames in the video)
+        if self.augment_crop_scale is not None:
+            _, _, fh, fw = frames.shape
+            scale = np.random.uniform(*self.augment_crop_scale)
+            ch, cw = int(fh * scale), int(fw * scale)
+            top = np.random.randint(0, fh - ch + 1)
+            left = np.random.randint(0, fw - cw + 1)
+            frames = frames[:, :, top:top+ch, left:left+cw]
+            frames = torch.nn.functional.interpolate(
+                frames, size=(self.video_size[0], self.video_size[1]),
+                mode="bilinear", align_corners=False,
+            )
+        # Apply color jitter per-frame (frames is T,C,H,W float [0,1])
+        if self.augment_transform is not None:
+            frames = torch.stack([self.augment_transform(f) for f in frames])
         # Back to uint8 (same as VideoDatasetFlat._get_frames)
         frames = torch.clamp(frames * 255.0, 0, 255).to(torch.uint8)
 
