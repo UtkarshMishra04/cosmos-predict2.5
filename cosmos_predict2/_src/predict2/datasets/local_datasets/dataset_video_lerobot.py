@@ -78,6 +78,9 @@ class LeRobotVideoDatasetFlat(Dataset):
         frame_skip: int = 1,
         video_backend: Optional[str] = None,
         augment: bool = False,
+        root: Optional[str] = None,
+        wrist_blackout_prob: float = 0.0,
+        cross_task_prob: float = 0.0,
     ) -> None:
         """
         Args:
@@ -90,6 +93,9 @@ class LeRobotVideoDatasetFlat(Dataset):
             video_backend: Video decoder backend ("torchcodec" or "pyav").
                 None = auto-detect. Use "pyav" for av1-encoded videos.
             augment: If True, apply color jitter and Gaussian blur augmentation.
+            root: Local directory where dataset is stored. If provided, loads
+                from disk at {root}/ instead of downloading from HuggingFace.
+            wrist_blackout_prob: Probability of blacking out wrist camera views.
         """
         super().__init__()
 
@@ -104,10 +110,12 @@ class LeRobotVideoDatasetFlat(Dataset):
         self.layout = layout
 
         # Load the LeRobot dataset
-        log.info(f"Loading LeRobot dataset: {repo_id}")
+        log.info(f"Loading LeRobot dataset: {repo_id}" + (f" from {root}" if root else ""))
         lerobot_kwargs = {"repo_id": repo_id}
         if video_backend is not None:
             lerobot_kwargs["video_backend"] = video_backend
+        if root is not None:
+            lerobot_kwargs["root"] = root
         self.lerobot_dataset = LeRobotDataset(**lerobot_kwargs)
 
         # Determine camera keys
@@ -147,6 +155,19 @@ class LeRobotVideoDatasetFlat(Dataset):
 
         self.valid_episodes = valid_episodes
         self.num_failed_loads = 0
+        self.cross_task_prob = cross_task_prob
+
+        # Collect all unique task strings for cross-task prompt mixing
+        self._all_tasks: list[str] = []
+        if cross_task_prob > 0:
+            seen = set()
+            for ep_idx in range(min(self.num_episodes, 5000)):
+                start = self.episodes[ep_idx][0]
+                task = self.lerobot_dataset[start].get("task", "")
+                if task and task not in seen:
+                    seen.add(task)
+                    self._all_tasks.append(task)
+            log.info(f"Cross-task mixing enabled: prob={cross_task_prob}, {len(self._all_tasks)} unique tasks")
 
         log.info(
             f"LeRobot dataset {repo_id}: {self.num_episodes} episodes, "
@@ -221,6 +242,11 @@ class LeRobotVideoDatasetFlat(Dataset):
 
         # Convert from float [0,1] to uint8 [0,255]
         combined = torch.clamp(combined * 255.0, 0, 255).to(torch.uint8)
+
+        # Cross-task prompt mixing for OOD generalization:
+        # Randomly replace the caption with a different task's caption
+        if self.cross_task_prob > 0 and self._all_tasks and np.random.random() < self.cross_task_prob:
+            caption = self._all_tasks[np.random.randint(len(self._all_tasks))]
 
         frame_ids = [local_start, local_start + span, ep_len]
         return combined, caption or "", frame_ids

@@ -167,15 +167,27 @@ def attention(
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        with sdpa_kernel_(backends=SDPA_BACKENDS):
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=causal,
-                dropout_p=dropout_p,
-                scale=softmax_scale,
-            )
+        try:
+            with sdpa_kernel_(backends=SDPA_BACKENDS):
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    is_causal=causal,
+                    dropout_p=dropout_p,
+                    scale=softmax_scale,
+                )
+        except RuntimeError:
+            # Fallback: try with MATH backend (slower but always works)
+            with sdpa_kernel_(backends=[SDPBackend.MATH]):
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    is_causal=causal,
+                    dropout_p=dropout_p,
+                    scale=softmax_scale,
+                )
 
         out = out.transpose(1, 2).contiguous()
         return out

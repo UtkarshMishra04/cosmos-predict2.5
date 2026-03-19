@@ -131,6 +131,10 @@ class Checkpointer:
             log.success(f"Saved checkpoint (local): {checkpoint_path}")
             iteration = int(checkpoint_file.replace("iter_", "").replace(".pt", ""))
             self.callbacks.on_save_checkpoint_success(iteration=iteration)
+            # Cleanup old checkpoints if keep_last_n is set
+            keep_n = getattr(self.config, "keep_last_n", 0)
+            if keep_n > 0 and rank == 0:
+                self._cleanup_old_checkpoints(keep_n)
         except Exception as e:  # noqa: BLE001
             log.exception(f"Checkpoint failed to save (local): {e}")
 
@@ -155,6 +159,18 @@ class Checkpointer:
             self.callbacks.on_save_checkpoint_success(iteration=iteration)
         except Exception as e:  # noqa: BLE001
             log.exception(f"Checkpoint failed to upload (object store): {e}")
+
+    def _cleanup_old_checkpoints(self, keep_n: int) -> None:
+        """Remove old checkpoints, keeping only the last N."""
+        import glob as _glob
+        ckpt_files = sorted(_glob.glob(os.path.join(self.checkpoint_dir_local, "iter_*.pt")))
+        if len(ckpt_files) > keep_n:
+            for old_ckpt in ckpt_files[:-keep_n]:
+                try:
+                    os.remove(old_ckpt)
+                    log.info(f"Removed old checkpoint: {old_ckpt}")
+                except OSError as e:
+                    log.warning(f"Failed to remove old checkpoint {old_ckpt}: {e}")
 
     @misc.timer("checkpoint loading")
     def load(

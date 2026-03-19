@@ -79,12 +79,18 @@ class AutoregressiveVideoGen(EveryN):
         self.local_dir = f"{config_job.path_local}/{self.name}"
         if distributed.get_rank() == 0:
             os.makedirs(self.local_dir, exist_ok=True)
-            log.info(f"AutoregressiveVideoGen: will save to {self.local_dir}")
+        log.info(
+            f"[AutoregressiveVideoGen] registered: every_n={self.every_n}, "
+            f"run_at_start={self.run_at_start}, n_autoreg_steps={self.n_autoreg_steps}, "
+            f"save_dir={self.local_dir}"
+        )
 
     @torch.no_grad()
     def every_n_impl(self, trainer, model, data_batch, output_batch, loss, iteration):
+        log.info(f"[AutoregressiveVideoGen] every_n_impl called at iteration={iteration}")
         if self.is_ema:
             if not model.config.ema.enabled:
+                log.info("[AutoregressiveVideoGen] EMA not enabled, skipping")
                 return
             context = partial(model.ema_scope, "autoreg_video_gen")
         else:
@@ -96,7 +102,8 @@ class AutoregressiveVideoGen(EveryN):
         torch.cuda.empty_cache()
 
         with context():
-            self._generate_and_save(model, data_batch, iteration, tag)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                self._generate_and_save(model, data_batch, iteration, tag)
 
         dist.barrier()
         torch.cuda.empty_cache()

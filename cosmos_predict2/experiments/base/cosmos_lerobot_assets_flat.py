@@ -25,7 +25,7 @@ from hydra.core.config_store import ConfigStore
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
-# from cosmos_predict2._src.predict2.callbacks.autoregressive_video_gen import AutoregressiveVideoGen
+from cosmos_predict2._src.predict2.callbacks.autoregressive_video_gen import AutoregressiveVideoGen
 from cosmos_predict2._src.predict2.callbacks.save_demo_data import SaveDemoData
 from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_video_lerobot import (
     LeRobotVideoDatasetFlat,
@@ -36,6 +36,11 @@ from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_video_droid i
     VideoDatasetFlat,
     get_generic_weighted_dataloader,
     get_weighted_sampler,
+)
+from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_video_libero import (
+    VideoDataset as LiberoVideoDataset,
+    get_generic_dataloader as get_generic_dataloader_libero,
+    get_sampler as get_sampler_libero,
 )
 from cosmos_predict2.config import MODEL_CHECKPOINTS, ModelKey, ModelSize
 
@@ -48,10 +53,11 @@ DEFAULT_CHECKPOINT_14B = MODEL_CHECKPOINTS[ModelKey(post_trained=False, size=Mod
 # ---------------------------------------------------------------------------
 # Dataset metadata: {name: (num_episodes, avg_episode_length, frame_skip)}
 DATASET_INFO = {
-    "libero":  (5614,  162, 1),  # libero_10 (1693) + libero_90 (3921)
+    "libero":  (1693 + 3921, 162, 1),  # libero_10 (1693) + libero_90 (3921)
     "droid":   (57774, 255, 2),
     "robocasa": (1199, 264, 2),
     "yam":     (92,    448, 4),
+    "gr1":     (24000, 350, 1),  # 24 tasks × 1000 episodes, ~350 frames/ep, no frame skip
 }
 NUM_FRAMES_PER_SAMPLE = 17
 
@@ -133,7 +139,7 @@ example_lerobot_libero_10_short = L(LeRobotVideoDatasetFlat)(
     video_size=(224, 224 * 2),
     camera_keys=None,  # Auto-detect from dataset
     layout="horizontal",  # 2 cameras → horizontal concat
-    augment=True,
+    augment=False,
 )
 
 example_lerobot_libero_90_short = L(LeRobotVideoDatasetFlat)(
@@ -142,17 +148,41 @@ example_lerobot_libero_90_short = L(LeRobotVideoDatasetFlat)(
     video_size=(224, 224 * 2),
     camera_keys=None,
     layout="horizontal",
-    augment=True,
+    augment=False,
+    video_backend="pyav",  # torchcodec can't decode this dataset's video format
+)
+
+# Failure videos with task-specific negative prompts ("the robot failed to {task}")
+# Uses LiberoVideoDataset format: videos/*.mp4 + metas/*.txt
+example_libero_failures = L(LiberoVideoDataset)(
+    dataset_dir="/k8s-nfs/dev_mishutk/openpi-video/data/libero_failure_videos",
+    num_frames=17,
+    video_size=(224, 448),
 )
 
 example_lerobot_libero_short = L(ConcatDataset)(
     datasets=[example_lerobot_libero_10_short, example_lerobot_libero_90_short],
 )
 
+# With failure videos mixed in (for negative prompt CFG training)
+example_lerobot_libero_short_with_failures = L(ConcatDataset)(
+    datasets=[example_lerobot_libero_10_short, example_lerobot_libero_90_short, example_libero_failures],
+)
+
 dataloader_train_lerobot_libero_short = L(get_generic_dataloader)(
     dataset=example_lerobot_libero_short,
     sampler=L(get_sampler)(dataset=example_lerobot_libero_short),
-    batch_size=16,
+    batch_size=4,
+    drop_last=True,
+    num_workers=8,
+    pin_memory=True,
+)
+
+# Weighted dataloader: 90% success (libero_10 + libero_90), 10% failure videos
+dataloader_train_lerobot_libero_short_with_failures = L(get_generic_weighted_dataloader)(
+    datasets=[example_lerobot_libero_10_short, example_lerobot_libero_90_short, example_libero_failures],
+    weights=[0.45, 0.45, 0.10],  # 90% success, 10% failure
+    batch_size=4,
     drop_last=True,
     num_workers=8,
     pin_memory=True,
@@ -245,7 +275,24 @@ dataloader_train_lerobot_yam_short = L(get_generic_dataloader)(
 # ---------------------------------------------------------------------------
 # Experiment: LIBERO
 # ---------------------------------------------------------------------------
-_libero_2b = compute_training_params("libero", batch_size_per_gpu=16, base_lr=2 ** (-15), target_full_passes=50)
+_libero_2b = compute_training_params("libero", batch_size_per_gpu=4, base_lr=2 ** (-17), target_full_passes=5000)
+
+# OOD validation dataset (pre-cropped 224x448 success rollouts)
+_libero_ood_val_dir = "/k8s-nfs/personal/mishutk/data/cosmos_libero_ood_val"
+example_libero_ood_val = L(LiberoVideoDataset)(
+    dataset_dir=_libero_ood_val_dir,
+    num_frames=17,
+    video_size=(224, 448),
+)
+dataloader_val_libero_ood = L(get_generic_dataloader_libero)(
+    dataset=example_libero_ood_val,
+    sampler=L(get_sampler_libero)(dataset=example_libero_ood_val),
+    batch_size=4,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+)
+
 predict2_video2world_training_2b_cosmos_lerobot_libero_flat_short = dict(
     defaults=[
         f"/experiment/{DEFAULT_CHECKPOINT.experiment}",
@@ -259,8 +306,9 @@ predict2_video2world_training_2b_cosmos_lerobot_libero_flat_short = dict(
         name="2b_cosmos_lerobot_libero_flat_short",
     ),
     dataloader_train=dataloader_train_lerobot_libero_short,
+    dataloader_val=dataloader_val_libero_ood,
     checkpoint=dict(
-        save_iter=_libero_2b["save_iter"],
+        save_iter=2000,
         load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
         load_from_object_store=dict(enabled=False),
         save_to_object_store=dict(enabled=False),
@@ -277,17 +325,76 @@ predict2_video2world_training_2b_cosmos_lerobot_libero_flat_short = dict(
     ),
     trainer=dict(
         logging_iter=100,
-        max_iter=_libero_2b["max_iter"],
+        max_iter=80000,
+        run_validation=True,
+        validation_iter=2000,
         callbacks=dict(
             heart_beat=dict(save_s3=False),
             iter_speed=dict(hit_thres=100, save_s3=False),
             device_monitor=dict(save_s3=False),
-            every_n_sample_reg=dict(every_n=5000, save_s3=False),
-            every_n_sample_ema=dict(every_n=5000, save_s3=False),
+            every_n_sample_reg=dict(every_n=2000, save_s3=False),
+            every_n_sample_ema=dict(every_n=2000, save_s3=False),
             wandb=dict(save_s3=False),
             wandb_10x=dict(save_s3=False),
             dataloader_speed=dict(save_s3=False),
             save_demo_data=L(SaveDemoData)(n_samples=4, fps=10),
+        ),
+    ),
+    model_parallel=dict(context_parallel_size=1),
+)
+
+# Variant with failure videos mixed in (negative prompt CFG)
+_libero_fail_2b = compute_training_params("libero", batch_size_per_gpu=4, base_lr=2 ** (-17), target_full_passes=5000)
+predict2_video2world_training_2b_cosmos_lerobot_libero_flat_short_with_failures = dict(
+    defaults=[
+        f"/experiment/{DEFAULT_CHECKPOINT.experiment}",
+        {"override /data_train": "mock"},
+        {"override /data_val": "mock"},
+        "_self_",
+    ],
+    job=dict(
+        project="cosmos_predict_v2p5",
+        group="video2world",
+        name="2b_cosmos_lerobot_libero_flat_short_with_failures",
+    ),
+    dataloader_train=dataloader_train_lerobot_libero_short_with_failures,
+    dataloader_val=dataloader_val_libero_ood,
+    checkpoint=dict(
+        save_iter=2000,
+        keep_last_n=2,  # Keep only last 2 checkpoints to save disk
+        load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
+        load_from_object_store=dict(enabled=False),
+        save_to_object_store=dict(enabled=False),
+    ),
+    optimizer=dict(
+        lr=_libero_fail_2b["lr"],
+        weight_decay=0.001,
+    ),
+    scheduler=dict(
+        f_max=[0.5],
+        f_min=[0.2],
+        warm_up_steps=[_libero_fail_2b["warm_up_steps"]],
+        cycle_lengths=[100000],
+    ),
+    trainer=dict(
+        logging_iter=100,
+        max_iter=80000,
+        run_validation=True,
+        validation_iter=2000,
+        callbacks=dict(
+            heart_beat=dict(save_s3=False),
+            iter_speed=dict(hit_thres=100, save_s3=False),
+            device_monitor=dict(save_s3=False),
+            every_n_sample_reg=dict(every_n=2000, save_s3=False),
+            every_n_sample_ema=dict(every_n=2000, save_s3=False),
+            wandb=dict(save_s3=False),
+            wandb_10x=dict(save_s3=False),
+            dataloader_speed=dict(save_s3=False),
+            save_demo_data=L(SaveDemoData)(n_samples=4, fps=10),
+            # autoreg_video_gen=L(AutoregressiveVideoGen)(
+            #     every_n=5000, n_autoreg_steps=10, num_sampling_steps=6,
+            #     guidance=0.0, n_samples=2, fps=10, run_at_start=True,
+            # ),
         ),
     ),
     model_parallel=dict(context_parallel_size=1),
@@ -522,15 +629,124 @@ predict2_video2world_training_2b_cosmos_lerobot_yam_wrist_blackout_flat_short = 
 )
 
 
+# ---------------------------------------------------------------------------
+# GR1 dataset (24 GR00T tabletop tasks, ego view only, 256x256 → 224x224)
+# ---------------------------------------------------------------------------
+GR1_TASKS = [
+    "PnPBottleToCabinetClose",
+    "PnPCanToDrawerClose",
+    "PnPCupToDrawerClose",
+    "PnPMilkToMicrowaveClose",
+    "PnPPotatoToMicrowaveClose",
+    "PnPWineToCabinetClose",
+    "PosttrainPnPNovelFromCuttingboardToBasketSplitA",
+    "PosttrainPnPNovelFromCuttingboardToCardboardboxSplitA",
+    "PosttrainPnPNovelFromCuttingboardToPanSplitA",
+    "PosttrainPnPNovelFromCuttingboardToPotSplitA",
+    "PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA",
+    "PosttrainPnPNovelFromPlacematToBasketSplitA",
+    "PosttrainPnPNovelFromPlacematToBowlSplitA",
+    "PosttrainPnPNovelFromPlacematToPlateSplitA",
+    "PosttrainPnPNovelFromPlacematToTieredshelfSplitA",
+    "PosttrainPnPNovelFromPlateToBowlSplitA",
+    "PosttrainPnPNovelFromPlateToCardboardboxSplitA",
+    "PosttrainPnPNovelFromPlateToPanSplitA",
+    "PosttrainPnPNovelFromPlateToPlateSplitA",
+    "PosttrainPnPNovelFromTrayToCardboardboxSplitA",
+    "PosttrainPnPNovelFromTrayToPlateSplitA",
+    "PosttrainPnPNovelFromTrayToPotSplitA",
+    "PosttrainPnPNovelFromTrayToTieredbasketSplitA",
+    "PosttrainPnPNovelFromTrayToTieredshelfSplitA",
+]
+
+_gr1_sub_datasets = [
+    L(LeRobotVideoDatasetFlat)(
+        repo_id=f"gr1_unified.{task}",
+        num_frames=17,
+        video_size=(224, 224),  # Single ego view, 256x256 native → resize to 224x224
+        camera_keys=None,  # Auto-detect (ego_view only)
+        layout="horizontal",
+        frame_skip=1,  # no frame skip, 17 consecutive frames at 20fps
+        augment=False,
+    )
+    for task in GR1_TASKS
+]
+
+example_lerobot_gr1_short = L(ConcatDataset)(
+    datasets=_gr1_sub_datasets,
+)
+
+dataloader_train_lerobot_gr1_short = L(get_generic_dataloader)(
+    dataset=example_lerobot_gr1_short,
+    sampler=L(get_sampler)(dataset=example_lerobot_gr1_short),
+    batch_size=8,
+    drop_last=True,
+    num_workers=8,
+    pin_memory=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Experiment: GR1
+# ---------------------------------------------------------------------------
+_gr1_2b = compute_training_params("gr1", batch_size_per_gpu=8, base_lr=2 ** (-15), target_full_passes=15)
+predict2_video2world_training_2b_cosmos_lerobot_gr1_flat_short = dict(
+    defaults=[
+        f"/experiment/{DEFAULT_CHECKPOINT.experiment}",
+        {"override /data_train": "mock"},
+        {"override /data_val": "mock"},
+        "_self_",
+    ],
+    job=dict(
+        project="cosmos_predict_v2p5",
+        group="video2world",
+        name="2b_cosmos_lerobot_gr1_flat_short",
+    ),
+    dataloader_train=dataloader_train_lerobot_gr1_short,
+    checkpoint=dict(
+        save_iter=_gr1_2b["save_iter"],
+        load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
+        load_from_object_store=dict(enabled=False),
+        save_to_object_store=dict(enabled=False),
+    ),
+    optimizer=dict(
+        lr=_gr1_2b["lr"],
+        weight_decay=0.001,
+    ),
+    scheduler=dict(
+        f_max=[0.5],
+        f_min=[0.2],
+        warm_up_steps=[_gr1_2b["warm_up_steps"]],
+        cycle_lengths=[100000],
+    ),
+    trainer=dict(
+        logging_iter=100,
+        max_iter=_gr1_2b["max_iter"],
+        callbacks=dict(
+            heart_beat=dict(save_s3=False),
+            iter_speed=dict(hit_thres=100, save_s3=False),
+            device_monitor=dict(save_s3=False),
+            every_n_sample_reg=dict(every_n=5000, save_s3=False),
+            every_n_sample_ema=dict(every_n=5000, save_s3=False),
+            wandb=dict(save_s3=False),
+            wandb_10x=dict(save_s3=False),
+            dataloader_speed=dict(save_s3=False),
+            save_demo_data=L(SaveDemoData)(n_samples=4, fps=10),
+        ),
+    ),
+    model_parallel=dict(context_parallel_size=1),
+)
+
+
 # ===========================================================================
 # 14B EXPERIMENTS
 # ===========================================================================
-_BASE_LR_14B = 2 ** (-15.5)  # Lower base LR for 14B (larger model → more sensitive)
+_BASE_LR_14B = 2 ** (-17.5)  # Lower base LR for 14B (larger model → more sensitive)
 
 # ---------------------------------------------------------------------------
 # Experiment: LIBERO 14B
 # ---------------------------------------------------------------------------
-_libero_14b = compute_training_params("libero", batch_size_per_gpu=16, base_lr=_BASE_LR_14B, target_full_passes=50)
+_libero_14b = compute_training_params("libero", batch_size_per_gpu=4, base_lr=_BASE_LR_14B, target_full_passes=5000)
 predict2_video2world_training_14b_cosmos_lerobot_libero_flat_short = dict(
     defaults=[
         f"/experiment/{DEFAULT_CHECKPOINT_14B.experiment}",
@@ -544,8 +760,9 @@ predict2_video2world_training_14b_cosmos_lerobot_libero_flat_short = dict(
         name="14b_cosmos_lerobot_libero_flat_short",
     ),
     dataloader_train=dataloader_train_lerobot_libero_short,
+    dataloader_val=dataloader_val_libero_ood,
     checkpoint=dict(
-        save_iter=_libero_14b["save_iter"],
+        save_iter=2000,
         load_path=get_checkpoint_path(DEFAULT_CHECKPOINT_14B.s3.uri),
         load_from_object_store=dict(enabled=False),
         save_to_object_store=dict(enabled=False),
@@ -562,14 +779,16 @@ predict2_video2world_training_14b_cosmos_lerobot_libero_flat_short = dict(
     ),
     trainer=dict(
         logging_iter=100,
-        max_iter=_libero_14b["max_iter"],
+        max_iter=80000,
+        run_validation=True,
+        validation_iter=2000,
         straggler_detection=dict(enabled=False),
         callbacks=dict(
             heart_beat=dict(save_s3=False),
             iter_speed=dict(hit_thres=100, save_s3=False),
             device_monitor=dict(save_s3=False),
-            every_n_sample_reg=dict(every_n=5000, save_s3=False),
-            every_n_sample_ema=dict(every_n=5000, save_s3=False),
+            every_n_sample_reg=dict(every_n=2000, save_s3=False),
+            every_n_sample_ema=dict(every_n=2000, save_s3=False),
             wandb=dict(save_s3=False),
             wandb_10x=dict(save_s3=False),
             dataloader_speed=dict(save_s3=False),
@@ -788,10 +1007,64 @@ predict2_video2world_training_14b_cosmos_lerobot_robocasa_flat_short = dict(
 )
 
 
+# ---------------------------------------------------------------------------
+# Experiment: GR1 14B
+# ---------------------------------------------------------------------------
+_gr1_14b = compute_training_params("gr1", batch_size_per_gpu=8, base_lr=_BASE_LR_14B, target_full_passes=15)
+predict2_video2world_training_14b_cosmos_lerobot_gr1_flat_short = dict(
+    defaults=[
+        f"/experiment/{DEFAULT_CHECKPOINT_14B.experiment}",
+        {"override /data_train": "mock"},
+        {"override /data_val": "mock"},
+        "_self_",
+    ],
+    job=dict(
+        project="cosmos_predict_v2p5",
+        group="video2world",
+        name="14b_cosmos_lerobot_gr1_flat_short",
+    ),
+    dataloader_train=dataloader_train_lerobot_gr1_short,
+    checkpoint=dict(
+        save_iter=_gr1_14b["save_iter"],
+        load_path=get_checkpoint_path(DEFAULT_CHECKPOINT_14B.s3.uri),
+        load_from_object_store=dict(enabled=False),
+        save_to_object_store=dict(enabled=False),
+    ),
+    optimizer=dict(
+        lr=_gr1_14b["lr"],
+        weight_decay=0.001,
+    ),
+    scheduler=dict(
+        f_max=[0.5],
+        f_min=[0.2],
+        warm_up_steps=[_gr1_14b["warm_up_steps"]],
+        cycle_lengths=[100000],
+    ),
+    trainer=dict(
+        logging_iter=100,
+        max_iter=_gr1_14b["max_iter"],
+        straggler_detection=dict(enabled=False),
+        callbacks=dict(
+            heart_beat=dict(save_s3=False),
+            iter_speed=dict(hit_thres=100, save_s3=False),
+            device_monitor=dict(save_s3=False),
+            every_n_sample_reg=dict(every_n=5000, save_s3=False),
+            every_n_sample_ema=dict(every_n=5000, save_s3=False),
+            wandb=dict(save_s3=False),
+            wandb_10x=dict(save_s3=False),
+            dataloader_speed=dict(save_s3=False),
+            save_demo_data=L(SaveDemoData)(n_samples=4, fps=10),
+        ),
+    ),
+    model_parallel=dict(context_parallel_size=1),
+)
+
+
 cs = ConfigStore.instance()
 
 for _item in [
     predict2_video2world_training_2b_cosmos_lerobot_libero_flat_short,
+    predict2_video2world_training_2b_cosmos_lerobot_libero_flat_short_with_failures,
     predict2_video2world_training_2b_cosmos_lerobot_droid_flat_short,
     predict2_video2world_training_2b_cosmos_lerobot_robocasa_flat_short,
     predict2_video2world_training_2b_cosmos_lerobot_yam_flat_short,
@@ -801,6 +1074,8 @@ for _item in [
     predict2_video2world_training_14b_cosmos_lerobot_robocasa_flat_short,
     predict2_video2world_training_14b_cosmos_lerobot_yam_flat_short,
     predict2_video2world_training_14b_cosmos_lerobot_yam_wrist_blackout_flat_short,
+    predict2_video2world_training_2b_cosmos_lerobot_gr1_flat_short,
+    predict2_video2world_training_14b_cosmos_lerobot_gr1_flat_short,
 ]:
     experiment_name = [name.lower() for name, value in globals().items() if value is _item][0]  # noqa: RUF015
     cs.store(
